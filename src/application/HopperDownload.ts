@@ -1,11 +1,12 @@
+/** Download result; HTTP failures may carry their observed status for diagnostics. */
+export interface HopperDownload {
+  readonly ok: boolean;
+  readonly bytes: Uint8Array;
+  readonly httpStatus?: number;
+}
+
 /** Maximum admitted vendor response bytes, shared by Hopper setup adapters. */
 export const HOPPER_DOWNLOAD_BYTES = 100_000_000;
-
-/** Whether the response a fetch produced came from the origin the caller validated. */
-const isExpectedOrigin = (response: Response, expectedOrigin: string): boolean =>
-  typeof response.url !== "string" ||
-  response.url === "" ||
-  new URL(response.url).origin === expectedOrigin;
 
 /** Bound observed response bytes before retaining them, including chunked bodies. */
 export const downloadHopperPackage = async (
@@ -15,7 +16,7 @@ export const downloadHopperPackage = async (
     readonly maxBytes?: number;
     readonly timeoutMs?: number;
   } = {},
-): Promise<{ readonly ok: boolean; readonly bytes: Uint8Array }> => {
+): Promise<HopperDownload> => {
   const timeoutMs = options.timeoutMs ?? 120_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000)
     throw new RangeError("Invalid Hopper response time budget");
@@ -27,25 +28,23 @@ export const downloadHopperPackage = async (
     maxBytes > HOPPER_DOWNLOAD_BYTES
   )
     throw new RangeError("Invalid Hopper response byte budget");
+  const response = await fetchHopperResponse(
+    url,
+    options.signal === undefined
+      ? deadline
+      : AbortSignal.any([options.signal, deadline]),
+  );
   const refused = { ok: false, bytes: new Uint8Array() };
-  const expectedOrigin = new URL(url).origin;
-  const response = await fetch(url, {
-    headers: { accept: "application/json", "user-agent": "rea-installer" },
-    signal:
-      options.signal === undefined
-        ? deadline
-        : AbortSignal.any([options.signal, deadline]),
-  });
-  // Redirects may leave the validated origin; only the initial URL was checked
-  // by callers, so refuse a response another origin ultimately produced.
-  if (!isExpectedOrigin(response, expectedOrigin)) {
+  if (response === undefined) return refused;
+  if (!response.ok) {
     await response.body?.cancel();
-    return refused;
+    return Number.isInteger(response.status) &&
+      response.status >= 300 &&
+      response.status <= 599
+      ? { ...refused, httpStatus: response.status }
+      : refused;
   }
-  if (
-    !response.ok ||
-    Number(response.headers.get("content-length")) > maxBytes
-  ) {
+  if (Number(response.headers.get("content-length")) > maxBytes) {
     await response.body?.cancel();
     return refused;
   }
@@ -66,5 +65,50 @@ export const downloadHopperPackage = async (
     }
   } finally {
     reader.releaseLock();
+  }
+};
+
+// HTTP-redirect fetch admits at most 20 redirects; retain that existing Fetch
+// bound while checking each destination before the next request.
+const FETCH_REDIRECT_LIMIT = 20;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+const fetchHopperResponse = async (
+  url: string,
+  signal: AbortSignal,
+): Promise<Response | undefined> => {
+  let selected: URL;
+  try {
+    selected = new URL(url);
+  } catch {
+    return undefined;
+  }
+  let requested = url;
+  const expectedOrigin = selected.origin;
+  for (let redirects = 0; ; redirects++) {
+    if (selected.protocol !== "https:") return undefined;
+    const response = await fetch(requested, {
+      redirect: "manual",
+      headers: { accept: "application/json", "user-agent": "rea-installer" },
+      signal,
+    });
+    if (!REDIRECT_STATUSES.has(response.status)) return response;
+    const location = response.headers.get("location");
+    await response.body?.cancel();
+    if (location === null || redirects === FETCH_REDIRECT_LIMIT)
+      return undefined;
+    let next: URL;
+    try {
+      next = new URL(location, selected);
+    } catch {
+      return undefined;
+    }
+    // Redirects may leave the validated origin; only the initial URL was
+    // checked by callers, so refuse a hop another origin would produce.
+    if (next.origin !== expectedOrigin) return undefined;
+    // Fetch inherits the previous fragment when Location has none.
+    if (!location.includes("#")) next.hash = selected.hash;
+    selected = next;
+    requested = next.href;
   }
 };
