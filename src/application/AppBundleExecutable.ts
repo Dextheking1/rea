@@ -327,8 +327,9 @@ const parseXmlPlistExecutable = (plist: string): string => {
 
 /** Apply the same decode budget the binary branch enforces before parsing XML. */
 const parseXmlPlistExecutableWithinBudget = (plist: Buffer): string => {
-  preflightPropertyListDecode(plist, BINARY_PLIST_DECODE_BYTES);
-  return parseXmlPlistExecutable(decodeXmlPlistText(plist));
+  const xmlText = decodeXmlPlistText(plist);
+  preflightPropertyListDecode(plist, BINARY_PLIST_DECODE_BYTES, xmlText);
+  return parseXmlPlistExecutable(xmlText);
 };
 
 const executableName = (value: unknown): string => {
